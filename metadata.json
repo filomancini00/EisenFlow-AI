@@ -1,0 +1,5 @@
+{
+  "name": "EisenFlow AI",
+  "description": "An intelligent productivity dashboard based on the Eisenhower Matrix. Prioritize tasks using AI and generate optimized daily schedules that integrate with your existing calendar meetings.",
+  "requestFramePermissions": []
+}
