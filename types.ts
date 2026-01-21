@@ -7,6 +7,7 @@ export interface Task {
   deadline: string; // ISO Date string
   estimatedHours: number;
   status: 'pending' | 'in-progress' | 'completed';
+  completedAt?: string; // ISO Date string
 }
 
 export interface CalendarEvent {
@@ -17,6 +18,8 @@ export interface CalendarEvent {
   type: 'meeting' | 'task_block' | 'break';
   taskId?: string; // If linked to a task
   isFixed: boolean; // True for Outlook meetings, False for AI suggestions
+  reasoning?: string; // AI explanation for scheduling this
+  quadrant?: string; // Q1, Q2, Q3, Q4
 }
 
 export enum Quadrant {
