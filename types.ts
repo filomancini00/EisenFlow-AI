@@ -6,8 +6,12 @@ export interface Task {
   urgency: number; // 1-5
   deadline: string; // ISO Date string
   estimatedHours: number;
-  status: 'pending' | 'in-progress' | 'completed';
+  status: 'pending' | 'completed';
   completedAt?: string; // ISO Date string
+  isFixed?: boolean;
+  recurrence?: 'none' | 'daily' | 'weekly' | 'weekdays';
+  startTime?: string; // HH:yy
+  finishTime?: string; // HH:mm
 }
 
 export interface CalendarEvent {
@@ -26,7 +30,7 @@ export enum Quadrant {
   Q1 = 'Do First',
   Q2 = 'Schedule',
   Q3 = 'Delegate',
-  Q4 = 'Eliminate',
+  Q4 = 'Fixed Schedule',
 }
 
 export interface DaySchedule {

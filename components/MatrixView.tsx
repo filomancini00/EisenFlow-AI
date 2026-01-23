@@ -1,6 +1,6 @@
 import React from 'react';
 import { Task, Quadrant } from '../types';
-import { AlertCircle, Calendar, Trash2, ArrowRightCircle, Plus } from 'lucide-react';
+import { AlertCircle, Calendar, Trash2, ArrowRightCircle, Plus, Lock } from 'lucide-react';
 import GlassCard from './GlassCard';
 
 interface MatrixViewProps {
@@ -12,6 +12,8 @@ interface MatrixViewProps {
 const MatrixView: React.FC<MatrixViewProps> = ({ tasks, onDelete, onEdit }) => {
 
   const getQuadrant = (t: Task): Quadrant => {
+    if (t.isFixed) return Quadrant.Q4;
+    // Fallback: If not explicitly fixed but lands in Q4 by score, we treat it as Q4 (Fixed Candidates) or just keep them there.
     if (t.relevance >= 3 && t.urgency >= 3) return Quadrant.Q1;
     if (t.relevance >= 3 && t.urgency < 3) return Quadrant.Q2;
     if (t.relevance < 3 && t.urgency >= 3) return Quadrant.Q3;
@@ -46,10 +48,10 @@ const MatrixView: React.FC<MatrixViewProps> = ({ tasks, onDelete, onEdit }) => {
         badge: 'bg-amber-500/20 text-amber-300 border-amber-500/30'
       };
       case Quadrant.Q4: return {
-        border: 'border-t-4 border-t-emerald-500',
-        bg: 'bg-emerald-500/10',
-        iconColor: 'text-emerald-400',
-        badge: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+        border: 'border-t-4 border-t-gray-500',
+        bg: 'bg-gray-500/10',
+        iconColor: 'text-gray-400',
+        badge: 'bg-gray-500/20 text-gray-300 border-gray-500/30'
       };
     }
   };
@@ -148,11 +150,11 @@ const MatrixView: React.FC<MatrixViewProps> = ({ tasks, onDelete, onEdit }) => {
         icon={ArrowRightCircle}
       />
       <QuadrantCard
-        title="Eliminate"
-        description="Not Urgent & Not Important"
+        title="Fixed Schedule"
+        description="Personal & Recurrent"
         tasks={groupedTasks[Quadrant.Q4]}
         type={Quadrant.Q4}
-        icon={Trash2}
+        icon={Lock}
       />
     </div>
   );

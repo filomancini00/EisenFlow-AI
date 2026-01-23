@@ -1,13 +1,18 @@
 import React from 'react';
 import { Task, CalendarEvent } from '../types';
-import { TrendingUp, CheckCircle, Clock, AlertCircle, ArrowRight, CreditCard, MoreVertical, Wallet, ArrowUpRight, ArrowDownRight, Bell, Search, Plus } from 'lucide-react';
+import { TrendingUp, CheckCircle, Clock, AlertCircle, ArrowRight, CreditCard, MoreVertical, Wallet, ArrowUpRight, ArrowDownRight, Bell, Search, Plus, MessageSquare, Send, X } from 'lucide-react';
 import GlassCard from './GlassCard';
+import { chatWithAI } from '../services/openaiService';
+import { useNotification } from '../contexts/NotificationContext';
 
 interface DashboardViewProps {
   tasks: Task[];
   events: CalendarEvent[];
   userName?: string;
   onNavigate: (tab: 'dashboard' | 'matrix' | 'schedule' | 'list') => void;
+  onAddTask?: (task: Task) => void;
+  onDeleteTask?: (id: string) => void;
+  onAddEvent?: (event: CalendarEvent) => void;
 }
 
 const StatPill: React.FC<{ icon: React.ReactNode; label: string; value: string; trend?: string; trendUp?: boolean; onClick?: () => void; highlight?: boolean }> = ({ icon, label, value, trend, trendUp, onClick, highlight }) => (
@@ -30,25 +35,128 @@ const StatPill: React.FC<{ icon: React.ReactNode; label: string; value: string; 
   </div>
 );
 
-const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName = "Filomancio", onNavigate }) => {
+const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName = "Filomancio", onNavigate, onAddTask, onDeleteTask, onAddEvent }) => {
   const [trendPeriod, setTrendPeriod] = React.useState<'week' | 'month'>('week');
   const [showAnalyticsModal, setShowAnalyticsModal] = React.useState(false);
+  const [showAlerts, setShowAlerts] = React.useState(false); // Alerts Modal State
   const [analyticsView, setAnalyticsView] = React.useState<'trend' | 'workload'>('trend');
 
-  const totalTasks = tasks.length;
-  const completedTasks = tasks.filter(t => t.status === 'completed').length;
-  const pendingTasks = tasks.filter(t => t.status === 'pending').length;
+  const { addToast } = useNotification();
 
-  // Calculate estimated hours remaining
-  const hoursRemaining = tasks
+  // Chat State
+  const [isChatOpen, setIsChatOpen] = React.useState(false);
+  const [chatMessage, setChatMessage] = React.useState('');
+  const [chatHistory, setChatHistory] = React.useState<{ role: 'user' | 'ai', text: string }[]>([
+    { role: 'ai', text: "Hi! I'm your EisenFlow assistant. Ask me anything or tell me to add tasks!" }
+  ]);
+  const [isChatLoading, setIsChatLoading] = React.useState(false);
+  const chatEndRef = React.useRef<HTMLDivElement>(null);
+
+  React.useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatHistory, isChatOpen]);
+
+  const handleSendMessage = async () => {
+    if (!chatMessage.trim()) return;
+
+    const userMsg = chatMessage;
+    setChatMessage('');
+    setChatHistory(prev => [...prev, { role: 'user', text: userMsg }]);
+    setIsChatLoading(true);
+
+    try {
+      const response = await chatWithAI(userMsg, tasks);
+
+      if (response.action === 'add_task' && response.taskData && onAddTask) {
+        // Create new task
+        const newTask: Task = {
+          id: crypto.randomUUID(),
+          title: response.taskData.title || "New Task",
+          description: response.taskData.description || "",
+          urgency: response.taskData.urgency || 3,
+          relevance: response.taskData.relevance || 3,
+          deadline: response.taskData.deadline || new Date().toISOString().split('T')[0],
+          estimatedHours: 1, // Default
+          status: 'pending'
+        };
+        onAddTask(newTask);
+
+        // Schedule event if time provided
+        if ((response.taskData as any).scheduledStart && onAddEvent) {
+          const startStr = (response.taskData as any).scheduledStart;
+          const startDate = new Date(startStr);
+          const endDate = new Date(startDate.getTime() + (newTask.estimatedHours * 60 * 60 * 1000));
+
+          const newEvent: CalendarEvent = {
+            id: crypto.randomUUID(),
+            title: newTask.title,
+            start: startStr,
+            end: endDate.toISOString().slice(0, 19), // Keep ISO format without ms/Z if needed by other logic, or standard ISO
+            isFixed: false,
+            type: 'task_block',
+            taskId: newTask.id,
+            reasoning: "Sheduled via Chat Assistant",
+            quadrant: 'Q2' // Default or infer?
+          };
+          onAddEvent(newEvent);
+        }
+
+        setChatHistory(prev => [...prev, { role: 'ai', text: response.text }]); // "Sure I added it"
+      } else {
+        // Just text response
+        setChatHistory(prev => [...prev, { role: 'ai', text: response.text }]);
+      }
+
+    } catch (e) {
+      setChatHistory(prev => [...prev, { role: 'ai', text: "Sorry, I encountered an error." }]);
+    } finally {
+      setIsChatLoading(false);
+    }
+  };
+
+  const workableTasks = tasks.filter(t => !t.isFixed);
+  const totalTasks = workableTasks.length;
+  const completedTasks = workableTasks.filter(t => t.status === 'completed').length;
+  const pendingTasks = workableTasks.filter(t => t.status === 'pending').length;
+
+  // Calculate estimated hours remaining (Workable only)
+  const hoursRemaining = workableTasks
     .filter(t => t.status !== 'completed')
     .reduce((acc, t) => acc + t.estimatedHours, 0);
-
   // Get upcoming tasks
   const upcomingTasks = tasks
     .filter(t => t.status !== 'completed')
     .sort((a, b) => new Date(a.deadline).getTime() - new Date(b.deadline).getTime())
     .slice(0, 3);
+
+  // --- Alerts Logic ---
+  const now = new Date(); // Use local consistency or state
+
+  // 1. Next Upcoming Event
+  const sortedFutureEvents = events
+    .filter(e => new Date(e.start) > now)
+    .sort((a, b) => new Date(a.start).getTime() - new Date(b.start).getTime());
+
+  const nextEvent = sortedFutureEvents[0];
+
+  // 2. Missed Tasks (Past Task Blocks for Pending Tasks)
+  const missedTasks = events
+    .filter(e => {
+      if (e.type !== 'task_block' && e.type !== 'meeting') return false; // consider meetings too? User said "past events"
+      // Let's stick to task blocks being "missed" implies work not done. 
+      // Meetings being "missed" implies you didn't mark them? 
+      // Let's include both if they are in the past.
+      return new Date(e.end) < now;
+    })
+    .filter(e => {
+      // If it's a task block, verify task status
+      if (e.taskId) {
+        const task = tasks.find(t => t.id === e.taskId);
+        return task && task.status === 'pending';
+      }
+      return false; // Ignore past meetings for "missed tasks" context unless we track meeting attendance?
+    })
+    .sort((a, b) => new Date(b.end).getTime() - new Date(a.end).getTime()); // Most recent missed first
 
   // --- Real Analytic Logic ---
 
@@ -63,9 +171,9 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
       d.setDate(now.getDate() - i);
       const dateStr = d.toISOString().split('T')[0];
 
-      // Count tasks completed on this day
+      // Count tasks completed on this day (Workable only)
       // Note: We rely on t.completedAt being set. If legacy tasks don't have it, they won't show.
-      const count = tasks.filter(t => {
+      const count = workableTasks.filter(t => {
         if (t.status !== 'completed' || !t.completedAt) return false;
         return t.completedAt.startsWith(dateStr);
       }).length;
@@ -118,16 +226,18 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
   const maxDailyHours = Math.max(...weeklyWorkload.map(d => d.total), 1); // For scaling
 
   // 2b. Quadrant Pending Hours (Needed for AI Strategy Card)
+  // 2b. Quadrant Pending Hours (Workable Only)
+  const workableTasksOnly = tasks.filter(t => !t.isFixed);
   const quadrantStats = {
-    Q1: tasks.filter(t => t.relevance >= 3 && t.urgency >= 3 && t.status !== 'completed').reduce((acc, t) => acc + t.estimatedHours, 0),
-    Q2: tasks.filter(t => t.relevance >= 3 && t.urgency < 3 && t.status !== 'completed').reduce((acc, t) => acc + t.estimatedHours, 0),
-    Q3: tasks.filter(t => t.relevance < 3 && t.urgency >= 3 && t.status !== 'completed').reduce((acc, t) => acc + t.estimatedHours, 0),
-    Q4: tasks.filter(t => t.relevance < 3 && t.urgency < 3 && t.status !== 'completed').reduce((acc, t) => acc + t.estimatedHours, 0),
+    Q1: workableTasksOnly.filter(t => t.relevance >= 3 && t.urgency >= 3 && t.status !== 'completed').reduce((acc, t) => acc + t.estimatedHours, 0),
+    Q2: workableTasksOnly.filter(t => t.relevance >= 3 && t.urgency < 3 && t.status !== 'completed').reduce((acc, t) => acc + t.estimatedHours, 0),
+    Q3: workableTasksOnly.filter(t => t.relevance < 3 && t.urgency >= 3 && t.status !== 'completed').reduce((acc, t) => acc + t.estimatedHours, 0),
+    Q4: workableTasksOnly.filter(t => t.relevance < 3 && t.urgency < 3 && t.status !== 'completed').reduce((acc, t) => acc + t.estimatedHours, 0),
   };
 
-  // 3. Goals (Completion Rates)
+  // 3. Goals (Completion Rates - Workable Only)
   const calculateGoal = (filterFn: (t: Task) => boolean) => {
-    const relevantTasks = tasks.filter(filterFn);
+    const relevantTasks = workableTasksOnly.filter(filterFn);
     if (relevantTasks.length === 0) return 0;
     const completed = relevantTasks.filter(t => t.status === 'completed').length;
     return Math.round((completed / relevantTasks.length) * 100);
@@ -146,22 +256,15 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
         {/* Header Section */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <h2 className="text-3xl font-bold flex items-center gap-2">
-            My Dashboard <CreditCard className="text-orange-400" size={28} />
+            My Dashboard
           </h2>
-          {/* Search/Actions Bar */}
-          <div className="flex items-center gap-4 bg-black/20 p-2 pr-6 rounded-full border border-white/5 backdrop-blur-md">
-            <div className="bg-white/5 rounded-full p-2">
-              <Search className="text-gray-400" size={20} />
-            </div>
-            <input
-              type="text"
-              placeholder="Search for tasks..."
-              className="bg-transparent border-none outline-none text-white text-sm w-48 placeholder-gray-500"
-            />
-            <div className="h-6 w-[1px] bg-white/10 mx-2"></div>
-            <button className="text-gray-400 hover:text-white transition-colors"><Bell size={20} /></button>
-            <button className="text-gray-400 hover:text-white transition-colors"><Plus size={20} /></button>
-          </div>
+          {/* Chat Assistant Trigger (Small) */}
+          <button
+            onClick={() => setIsChatOpen(!isChatOpen)}
+            className="md:hidden self-end flex items-center gap-2 text-xs bg-white/10 px-3 py-1 rounded-full"
+          >
+            <MessageSquare size={14} /> AI Assistant
+          </button>
         </div>
 
         {/* Stats Row */}
@@ -413,6 +516,7 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
 
                     <span className="text-[10px] font-medium opacity-60">Alerts</span>
                   </div>
+
                 </div>
 
                 {/* AI Strategy Insight Card */}
@@ -512,6 +616,107 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
         </div>
       </div>
 
+      {/* Alerts Modal */}
+      {showAlerts && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in duration-200">
+          <GlassCard className="w-full max-w-lg relative flex flex-col gap-6">
+            <button
+              onClick={() => setShowAlerts(false)}
+              className="absolute top-4 right-4 text-gray-400 hover:text-white transition-colors"
+            >
+              <X size={20} />
+            </button>
+
+            <div className="flex items-center gap-3 border-b border-white/10 pb-4">
+              <div className="p-3 bg-blue-500/20 rounded-xl text-blue-400 shadow-[0_0_15px_rgba(59,130,246,0.3)]">
+                <Bell size={24} />
+              </div>
+              <div>
+                <h2 className="text-xl font-bold text-white">Your Alerts</h2>
+                <p className="text-sm text-gray-400">Stay on top of your schedule</p>
+              </div>
+            </div>
+
+            <div className="space-y-6">
+              {/* Next Event */}
+              <div>
+                <h3 className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-3 flex items-center gap-2">
+                  <Clock size={12} /> Upcoming
+                </h3>
+                {nextEvent ? (
+                  <div className="bg-gradient-to-r from-indigo-500/20 to-purple-500/20 border border-indigo-500/30 rounded-xl p-4 flex items-center gap-4 relative overflow-hidden group">
+                    <div className="absolute left-0 top-0 w-1 h-full bg-indigo-500"></div>
+                    <div className="p-3 bg-black/20 rounded-lg text-indigo-300">
+                      {nextEvent.isFixed ? <MoreVertical size={20} /> : <CheckCircle size={20} />}
+                    </div>
+                    <div className="flex-1">
+                      <h4 className="font-bold text-lg">{nextEvent.title}</h4>
+                      <p className="text-sm text-indigo-200/70">
+                        {new Date(nextEvent.start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} - {new Date(nextEvent.end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                      </p>
+                      <div className="text-xs text-gray-500 mt-1">
+                        Starts in {Math.round((new Date(nextEvent.start).getTime() - new Date().getTime()) / 60000)} mins
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-center p-6 bg-white/5 rounded-xl border border-white/5 text-gray-500">
+                    <p>No upcoming events today.</p>
+                  </div>
+                )}
+              </div>
+
+              {/* Missed Tasks */}
+              <div>
+                <h3 className="text-xs font-bold text-rose-400/80 uppercase tracking-widest mb-3 flex items-center gap-2">
+                  <AlertCircle size={12} /> Missed & Pending
+                </h3>
+
+                <div className="space-y-2 max-h-[200px] overflow-y-auto custom-scrollbar pr-2">
+                  {missedTasks.length > 0 ? missedTasks.map(event => (
+                    <div key={event.id} className="bg-rose-500/10 border border-rose-500/20 rounded-lg p-3 flex items-center justify-between group hover:bg-rose-500/20 transition-colors">
+                      <div className="flex items-center gap-3">
+                        <div className="w-1.5 h-1.5 rounded-full bg-rose-500"></div>
+                        <div>
+                          <p className="font-bold text-sm text-rose-100">{event.title}</p>
+                          <p className="text-xs text-rose-300/60">
+                            Scheduled: {new Date(event.start).toLocaleDateString()} at {new Date(event.start).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => {
+                          // Optional: Navigate to task or mark done? 
+                          // For now just close alerts and let them go to list
+                          setShowAlerts(false);
+                          onNavigate('list');
+                        }}
+                        className="text-xs bg-rose-500/20 hover:bg-rose-500 text-rose-300 hover:text-white px-2 py-1 rounded transition-colors"
+                      >
+                        Review
+                      </button>
+                    </div>
+                  )) : (
+                    <div className="text-center p-4 bg-white/5 rounded-xl border border-white/5 text-gray-500 text-sm">
+                      All clear! No missed tasks.
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="pt-4 border-t border-white/10 flex justify-end">
+              <button
+                onClick={() => setShowAlerts(false)}
+                className="px-4 py-2 bg-white/10 hover:bg-white/20 rounded-lg text-sm font-medium transition-colors"
+              >
+                Close
+              </button>
+            </div>
+          </GlassCard>
+        </div>
+      )}
+
       {/* Analytics Modal */}
       {showAnalyticsModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
@@ -601,7 +806,7 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
                           {day.Q1 > 0 && <div style={{ height: `${hQ1}%` }} className="w-full bg-rose-500 hover:bg-rose-400 relative group/segment"><span className="opacity-0 group-hover/segment:opacity-100 absolute inset-0 flex items-center justify-center text-xs font-bold">{day.Q1.toFixed(1)}h</span></div>}
                           {day.Q2 > 0 && <div style={{ height: `${hQ2}%` }} className="w-full bg-blue-500 hover:bg-blue-400 relative group/segment"><span className="opacity-0 group-hover/segment:opacity-100 absolute inset-0 flex items-center justify-center text-xs font-bold">{day.Q2.toFixed(1)}h</span></div>}
                           {day.Q3 > 0 && <div style={{ height: `${hQ3}%` }} className="w-full bg-amber-500 hover:bg-amber-400 relative group/segment"><span className="opacity-0 group-hover/segment:opacity-100 absolute inset-0 flex items-center justify-center text-xs font-bold">{day.Q3.toFixed(1)}h</span></div>}
-                          {day.Q4 > 0 && <div style={{ height: `${hQ4}%` }} className="w-full bg-emerald-500 hover:bg-emerald-400 relative group/segment"><span className="opacity-0 group-hover/segment:opacity-100 absolute inset-0 flex items-center justify-center text-xs font-bold">{day.Q4.toFixed(1)}h</span></div>}
+                          {day.Q4 > 0 && <div style={{ height: `${hQ4}%` }} className="w-full bg-gray-500 hover:bg-gray-400 relative group/segment"><span className="opacity-0 group-hover/segment:opacity-100 absolute inset-0 flex items-center justify-center text-xs font-bold">{day.Q4.toFixed(1)}h</span></div>}
 
                           <div className="absolute bottom-2 w-full text-center text-sm text-white/40 pb-1 pointer-events-none font-bold uppercase tracking-wider">{day.day}</div>
                           <div className="absolute top-2 w-full text-center text-lg font-bold text-white/50">{day.total.toFixed(1)}h</div>
@@ -614,7 +819,7 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
                     <div className="flex items-center gap-2"><div className="w-3 h-3 bg-rose-500 rounded-full"></div><span className="text-gray-400 text-sm">Urgent (Q1)</span></div>
                     <div className="flex items-center gap-2"><div className="w-3 h-3 bg-blue-500 rounded-full"></div><span className="text-gray-400 text-sm">Strategic (Q2)</span></div>
                     <div className="flex items-center gap-2"><div className="w-3 h-3 bg-amber-500 rounded-full"></div><span className="text-gray-400 text-sm">Delegate (Q3)</span></div>
-                    <div className="flex items-center gap-2"><div className="w-3 h-3 bg-emerald-500 rounded-full"></div><span className="text-gray-400 text-sm">Eliminate (Q4)</span></div>
+                    <div className="flex items-center gap-2"><div className="w-3 h-3 bg-gray-500 rounded-full"></div><span className="text-gray-400 text-sm">Fixed (Q4)</span></div>
                   </div>
                 </div>
               )}
@@ -622,6 +827,74 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
           </GlassCard>
         </div>
       )}
+
+      {/* AI Chat Widget (Floating) */}
+      <div className={`fixed bottom-6 right-6 z-50 flex flex-col items-end gap-4 transition-all duration-300`}>
+
+        {/* Main Chat Window */}
+        {isChatOpen && (
+          <GlassCard className="w-80 md:w-96 h-[500px] flex flex-col overflow-hidden shadow-2xl border-white/20 animate-in slide-in-from-bottom-10 fade-in duration-200">
+            {/* Header */}
+            <div className="p-3 border-b border-white/10 flex justify-between items-center bg-white/5">
+              <div className="flex items-center gap-2">
+                <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse"></div>
+                <span className="font-bold text-sm">AI Assistant</span>
+              </div>
+              <button onClick={() => setIsChatOpen(false)} className="hover:text-white text-gray-400"><X size={16} /></button>
+            </div>
+
+            {/* Messages */}
+            <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-black/20">
+              {chatHistory.map((msg, i) => (
+                <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-[85%] rounded-2xl px-4 py-2 text-sm ${msg.role === 'user' ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-white/10 text-gray-200 rounded-bl-none'}`}>
+                    {msg.text}
+                  </div>
+                </div>
+              ))}
+              {isChatLoading && (
+                <div className="flex justify-start">
+                  <div className="bg-white/10 rounded-2xl rounded-bl-none px-4 py-2 flex gap-1">
+                    <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce"></div>
+                    <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce delay-75"></div>
+                    <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce delay-150"></div>
+                  </div>
+                </div>
+              )}
+              <div ref={chatEndRef}></div>
+            </div>
+
+            {/* Input */}
+            <div className="p-3 bg-white/5 border-t border-white/10 flex gap-2">
+              <input
+                type="text"
+                value={chatMessage}
+                onChange={(e) => setChatMessage(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
+                placeholder="Ask or tell me to add a task..."
+                className="flex-1 bg-black/20 border border-white/10 rounded-full px-4 py-2 text-sm focus:outline-none focus:border-indigo-500 transition-colors"
+              />
+              <button
+                onClick={handleSendMessage}
+                className="p-2 bg-indigo-600 hover:bg-indigo-500 rounded-full text-white transition-colors disabled:opacity-50"
+                disabled={!chatMessage.trim() || isChatLoading}
+              >
+                <Send size={16} />
+              </button>
+            </div>
+          </GlassCard>
+        )}
+
+        {/* Floating Toggle Button */}
+        {!isChatOpen && (
+          <button
+            onClick={() => setIsChatOpen(true)}
+            className="w-14 h-14 rounded-full bg-indigo-600 hover:bg-indigo-500 shadow-[0_0_20px_rgba(79,70,229,0.5)] flex items-center justify-center text-white transition-transform hover:scale-110 group"
+          >
+            <MessageSquare size={24} className="group-hover:animate-pulse" />
+          </button>
+        )}
+      </div>
     </div>
   );
 };

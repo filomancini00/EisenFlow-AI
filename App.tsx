@@ -1,5 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, LayoutGrid, Calendar as CalendarIcon, LayoutDashboard, Sparkles, Settings, List } from 'lucide-react';
+import { useEventNotifications } from './hooks/useEventNotifications';
+import { NotificationProvider } from './contexts/NotificationContext';
+
+import { Plus, LayoutGrid, Calendar as CalendarIcon, LayoutDashboard, Sparkles, Settings, List, LogOut, User as UserIcon } from 'lucide-react';
 import { Task, CalendarEvent } from './types';
 import { INITIAL_TASKS, MOCK_MEETINGS } from './constants';
 import MatrixView from './components/MatrixView';
@@ -8,23 +11,40 @@ import TaskListView from './components/TaskListView';
 import DashboardView from './components/DashboardView';
 import TaskForm from './components/TaskForm';
 import { optimizeSchedule } from './services/openaiService';
+import { AuthProvider, useAuth } from './contexts/AuthContext';
+import AuthModal from './components/AuthModal';
+import SettingsModal from './components/SettingsModal';
 
-const App: React.FC = () => {
+import { supabase } from './services/supabaseClient';
+import { GoogleOAuthProvider, useGoogleLogin } from '@react-oauth/google';
+import { getGoogleCalendarEvents } from './services/googleCalendarService';
+import ErrorBoundary from './components/ErrorBoundary';
+
+const EisenFlowApp: React.FC = () => {
+  const { user, login, signup, logout, isLoading: isAuthLoading } = useAuth();
   const [activeTab, setActiveTab] = useState<'dashboard' | 'matrix' | 'schedule' | 'list'>('dashboard');
-  // Initialize state from LocalStorage if available, else use defaults
-  const [tasks, setTasks] = useState<Task[]>(() => {
-    const saved = localStorage.getItem('eisenflow_tasks');
-    return saved ? JSON.parse(saved) : INITIAL_TASKS;
-  });
 
-  const [events, setEvents] = useState<CalendarEvent[]>(() => {
-    const saved = localStorage.getItem('eisenflow_events');
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [events, setEvents] = useState<CalendarEvent[]>([]);
+
+  // Enable Browser Notifications
+  useEventNotifications(events);
+
   const [isFormOpen, setIsFormOpen] = useState(false);
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<Task | undefined>(undefined);
   const [isLoadingSchedule, setIsLoadingSchedule] = useState(false);
   const [scheduleError, setScheduleError] = useState<string | null>(null);
+  const [googleAccessToken, setGoogleAccessToken] = useState<string | null>(() => localStorage.getItem('google_access_token'));
+
+  // Persist Google Token
+  useEffect(() => {
+    if (googleAccessToken) {
+      localStorage.setItem('google_access_token', googleAccessToken);
+    } else {
+      localStorage.removeItem('google_access_token');
+    }
+  }, [googleAccessToken]);
 
   // Date state - defaults to today
   const [currentDate, setCurrentDate] = useState(new Date().toISOString().split('T')[0]);
@@ -38,6 +58,8 @@ const App: React.FC = () => {
     return () => clearInterval(timer);
   }, []);
 
+
+
   // Determine current event
   const currentEvent = events.find(e => {
     const start = new Date(e.start);
@@ -45,29 +67,55 @@ const App: React.FC = () => {
     return now >= start && now < end;
   });
 
-  // Persistence Effects
+  // Load Data
   useEffect(() => {
-    localStorage.setItem('eisenflow_tasks', JSON.stringify(tasks));
-  }, [tasks]);
+    if (isAuthLoading) return;
+
+    const loadData = async () => {
+      if (user) {
+        // Load from Supabase
+        const { data: tasksData } = await supabase.from('tasks').select('*');
+        if (tasksData) setTasks(tasksData as any);
+
+        const { data: eventsData } = await supabase.from('events').select('*');
+        if (eventsData) setEvents(eventsData as any);
+      } else {
+        // Load from Local Storage (Guest)
+        const savedTasks = localStorage.getItem('eisenflow_tasks_guest');
+        const savedEvents = localStorage.getItem('eisenflow_events_guest');
+
+        if (savedTasks) setTasks(JSON.parse(savedTasks));
+        else setTasks(INITIAL_TASKS);
+
+        if (savedEvents) setEvents(JSON.parse(savedEvents));
+        else {
+          const today = new Date().toISOString().split('T')[0];
+          const transformedEvents = MOCK_MEETINGS.map(m => ({
+            ...m,
+            start: `${today}T${m.start}:00`,
+            end: `${today}T${m.end}:00`
+          }));
+          setEvents(transformedEvents);
+        }
+      }
+    };
+
+    loadData();
+  }, [user, isAuthLoading]);
+
+  // Persistence (Auto-Save mainly for Guest, for Supabase we save on action)
+  useEffect(() => {
+    if (isAuthLoading || user) return; // Don't auto-save to LS if user logged in
+    localStorage.setItem('eisenflow_tasks_guest', JSON.stringify(tasks));
+  }, [tasks, user, isAuthLoading]);
 
   useEffect(() => {
-    localStorage.setItem('eisenflow_events', JSON.stringify(events));
-  }, [events]);
+    if (isAuthLoading || user) return;
+    localStorage.setItem('eisenflow_events_guest', JSON.stringify(events));
+  }, [events, user, isAuthLoading]);
 
-  // Load initial mocks only if no events exist (and it's the very first run, optional logic)
-  useEffect(() => {
-    if (events.length === 0) {
-      const today = new Date().toISOString().split('T')[0];
-      const transformedEvents = MOCK_MEETINGS.map(m => ({
-        ...m,
-        start: `${today}T${m.start}:00`,
-        end: `${today}T${m.end}:00`
-      }));
-      setEvents(transformedEvents);
-    }
-  }, []);
 
-  const handleSaveTask = (task: Task) => {
+  const handleSaveTask = async (task: Task) => {
     // Logic to handle completion timestamp
     const updatedTask = { ...task };
     if (updatedTask.status === 'completed' && !updatedTask.completedAt) {
@@ -76,17 +124,35 @@ const App: React.FC = () => {
       updatedTask.completedAt = undefined;
     }
 
+    // Optimistic Update
+    let newTasks;
     if (editingTask) {
-      setTasks(tasks.map(t => t.id === updatedTask.id ? updatedTask : t));
+      newTasks = tasks.map(t => t.id === updatedTask.id ? updatedTask : t);
     } else {
-      setTasks([...tasks, updatedTask]);
+      updatedTask.id = updatedTask.id || crypto.randomUUID(); // Ensure UUID for Supabase
+      newTasks = [...tasks, updatedTask];
     }
+    setTasks(newTasks);
+
+    // Persist
+    if (user) {
+      // Supabase Upsert
+      const { error } = await supabase.from('tasks').upsert({
+        ...updatedTask,
+        user_id: user.id
+      });
+      if (error) console.error("Failed to save task:", error);
+    }
+
     setIsFormOpen(false);
     setEditingTask(undefined);
   };
 
-  const handleDeleteTask = (id: string) => {
+  const handleDeleteTask = async (id: string) => {
     setTasks(tasks.filter(t => t.id !== id));
+    if (user) {
+      await supabase.from('tasks').delete().eq('id', id);
+    }
   };
 
   const handleEditTask = (task: Task) => {
@@ -94,32 +160,233 @@ const App: React.FC = () => {
     setIsFormOpen(true);
   };
 
+
+  const handleAddEvent = async (event: CalendarEvent) => {
+    if (events.some(e => e.id === event.id)) return;
+
+    const newEvents = [...events, event];
+    setEvents(newEvents);
+
+    if (user) {
+      await supabase.from('events').insert({
+        ...event,
+        user_id: user.id
+      });
+    }
+  };
+
+
+  // Helper to sync events
+  const syncGoogleEvents = async (token: string) => {
+    try {
+      console.log("DEBUG: Syncing Google Calendar Events...");
+      const now = new Date();
+      const start = new Date(now);
+      start.setDate(start.getDate() - 30);
+      const end = new Date(now);
+      end.setDate(end.getDate() + 90);
+
+      const refreshedGoogleEvents = await getGoogleCalendarEvents(token, start.toISOString(), end.toISOString());
+
+      setEvents(prevEvents => {
+        // Filter out existing google events to compare
+        const existingGoogleEvents = prevEvents.filter(e => e.id.startsWith('google-'));
+
+        // Simple comparison: Check if length differs or if IDs/Times differ
+        // We can use JSON stringify for a quick deep check of the data subset
+        const isDifferent = JSON.stringify(existingGoogleEvents) !== JSON.stringify(refreshedGoogleEvents);
+
+        if (!isDifferent) {
+          console.log("DEBUG: Google Events Unchanged. Skipping update.");
+          return prevEvents;
+        }
+
+        console.log("DEBUG: Google Events Changed. Updating state.");
+        const nonGoogleEvents = prevEvents.filter(e => !e.id.startsWith('google-'));
+        return [...nonGoogleEvents, ...refreshedGoogleEvents];
+      });
+
+    } catch (err: any) {
+      console.error("Failed to sync Google events", err);
+      if (err.status === 401) {
+        console.log("Google Token expired or invalid. disconnect.");
+        setGoogleAccessToken(null);
+      }
+    }
+  };
+
+  // Google Login Hook
+  const connectGoogle = useGoogleLogin({
+    onSuccess: async (tokenResponse) => {
+      setGoogleAccessToken(tokenResponse.access_token);
+      await syncGoogleEvents(tokenResponse.access_token);
+    },
+    onError: errorResponse => console.error(errorResponse),
+    scope: 'https://www.googleapis.com/auth/calendar.readonly'
+  });
+
+  // Poll Google Calendar every 60 seconds (and sync immediately on load/connect)
+  useEffect(() => {
+    if (!googleAccessToken) return;
+
+    // Immediate sync on mount/token change
+    syncGoogleEvents(googleAccessToken);
+
+    const intervalId = setInterval(() => {
+      syncGoogleEvents(googleAccessToken);
+    }, 60000); // 1 minute
+
+    return () => clearInterval(intervalId);
+  }, [googleAccessToken]);
+
+  const handleConnectGoogle = () => {
+    connectGoogle();
+  };
+
+
   const generateSchedule = async () => {
     setIsLoadingSchedule(true);
     setScheduleError(null);
+
+    // 0. Refresh Google Events if connected
+    let currentEvents = [...events];
+
+    if (googleAccessToken) {
+      try {
+        const now = new Date();
+        const start = new Date(now);
+        start.setDate(start.getDate() - 30);
+        const end = new Date(now);
+        end.setDate(end.getDate() + 90);
+
+        const refreshedGoogleEvents = await getGoogleCalendarEvents(googleAccessToken, start.toISOString(), end.toISOString());
+
+        // Sync Local Var for calculation
+        const nonGoogleEvents = currentEvents.filter(e => !e.id.startsWith('google-'));
+        currentEvents = [...nonGoogleEvents, ...refreshedGoogleEvents];
+
+        // Also update React State
+        setEvents(currentEvents);
+      } catch (e) { console.error(e); }
+    }
+
+    console.log("DEBUG: generateSchedule START. Events in state:", currentEvents.length);
+    if (currentEvents.length > 0) {
+      console.log("DEBUG: First event sample:", currentEvents[0]);
+      console.log("DEBUG: Fixed events count in state:", currentEvents.filter(e => e.isFixed).length);
+      console.log("DEBUG: Events starting with 'google-':", currentEvents.filter(e => e.id.startsWith('google-')).length);
+    }
+
     try {
-      // 1. Get fixed events (Outlook/Calendar)
-      const fixedEvents = events.filter(e => e.isFixed);
+      // 1. Separate tasks
+      const fixedTasks = tasks.filter(t => t.isFixed);
+      const flexibleTasks = tasks.filter(t => !t.isFixed);
 
-      // 2. Generate new schedule for NEXT 7 DAYS
-      const newWeeklySchedule = await optimizeSchedule(tasks, fixedEvents, currentDate, 7);
+      // 2. Expand Fixed Tasks into Events (Recurrence Logic)
+      const recurrenceEvents: CalendarEvent[] = [];
+      const windowStart = new Date(currentDate);
 
-      // 3. Define the window to clear (currentDate to currentDate + 7 days)
-      const startWindow = new Date(currentDate);
-      const endWindow = new Date(startWindow);
+      fixedTasks.forEach(task => {
+        const startTime = task.startTime || "09:00";
+
+        for (let i = 0; i < 7; i++) {
+          const day = new Date(windowStart);
+          day.setDate(day.getDate() + i);
+          const dateStr = day.toISOString().split('T')[0];
+          const startIso = `${dateStr}T${startTime}:00`;
+
+          let endIso;
+          if (task.finishTime) {
+            const startDate = new Date(startIso);
+            const endDate = new Date(`${dateStr}T${task.finishTime}:00`);
+            if (endDate <= startDate) {
+              endDate.setDate(endDate.getDate() + 1); // Handle overnight
+            }
+            endIso = endDate.toISOString().slice(0, 19);
+          } else {
+            // Fallback to estimatedHours
+            let duration = Number(task.estimatedHours);
+            if (!duration || isNaN(duration) || duration <= 0) {
+              duration = 1; // Default to 1 hour if invalid
+            }
+            endIso = new Date(new Date(startIso).getTime() + (duration * 3600000)).toISOString().slice(0, 19);
+          }
+
+          let shouldAdd = false;
+          if (task.recurrence === 'daily') shouldAdd = true;
+          else if (task.recurrence === 'weekly' && day.getDay() === new Date(task.deadline).getDay()) shouldAdd = true; // Use deadline as "day of week" reference
+          else if (task.recurrence === 'weekdays' && day.getDay() !== 0 && day.getDay() !== 6) shouldAdd = true;
+          else if (!task.recurrence || task.recurrence === 'none') {
+            // Only add if date matches deadline (Single Instance) - but strict check? 
+            // Or if it falls within window. Let's assume strict deadline match for single instance.
+            if (dateStr === task.deadline.split('T')[0]) shouldAdd = true;
+          }
+
+          if (shouldAdd) {
+            recurrenceEvents.push({
+              id: `fixed-${task.id}-${dateStr}`,
+              title: task.title,
+              start: startIso,
+              end: endIso,
+              type: 'task_block',
+              taskId: task.id,
+              isFixed: true, // Treated as fixed for the AI
+              reasoning: "Fixed Commitment",
+              quadrant: 'Q4'
+            });
+          }
+        }
+      });
+
+      // 3. Get existing fixed events (Outlook/Calendar)
+      // Debug log
+      console.log("DEBUG: Filtering existing fixed events from", currentEvents.length, "events");
+      const existingFixedEvents = currentEvents.filter(e => !!e.isFixed && !e.id.startsWith('fixed-'));
+      console.log("DEBUG: Found existingFixedEvents:", existingFixedEvents.length);
+
+      const allFixedConstraints = [...existingFixedEvents, ...recurrenceEvents];
+
+      // 4. Generate new schedule for NEXT 7 DAYS with Flexible Tasks only
+      let newWeeklySchedule = await optimizeSchedule(flexibleTasks, allFixedConstraints, currentDate, 7, dayStartHour, dayEndHour);
+
+      // 4b. CORRECT THE QUADRANTS (Don't trust AI labels)
+      newWeeklySchedule = newWeeklySchedule.map(ev => {
+        const task = flexibleTasks.find(t => t.id === ev.taskId);
+        if (!task) return ev;
+
+        let trueQuadrant = 'Q4';
+        if (task.relevance >= 3 && task.urgency >= 3) trueQuadrant = 'Q1';
+        else if (task.relevance >= 3 && task.urgency < 3) trueQuadrant = 'Q2';
+        else if (task.relevance < 3 && task.urgency >= 3) trueQuadrant = 'Q3';
+
+        return { ...ev, quadrant: trueQuadrant };
+      });
+
+      // 5. Define the window to clear
+      const endWindow = new Date(windowStart);
       endWindow.setDate(endWindow.getDate() + 7);
       const endWindowStr = endWindow.toISOString().split('T')[0];
 
-      // 4. Keep events OUTSIDE the window (Past events OR Future events beyond 7 days)
-      // Note: We depend on string comparison. '2023-01-01' < '2023-01-02'.
-      // e.start is ISO (YYYY-MM-DDTHH:mm). currentDate is YYYY-MM-DD.
-      const preservedEvents = events.filter(e => {
+      // 6. Keep FLEXIBLE events OUTSIDE the window (since we are replacing the window, and re-adding all fixed)
+      const preservedFlexibleEvents = currentEvents.filter(e => {
         const eDate = e.start.split('T')[0];
-        return eDate < currentDate || eDate >= endWindowStr;
+        // Keep only if outside window AND NOT FIXED (because ALL fixed are in allFixedConstraints/existingFixedEvents)
+        return (eDate < currentDate || eDate >= endWindowStr) && !e.isFixed;
       });
 
-      // 5. Merge
-      setEvents([...preservedEvents, ...newWeeklySchedule]);
+      console.log('DEBUG: generateSchedule', {
+        totalEvents: events.length,
+        fixed: existingFixedEvents.length,
+        recurrence: recurrenceEvents.length,
+        newWeekly: newWeeklySchedule.length,
+        preservedFlex: preservedFlexibleEvents.length
+      });
+
+      // 7. Merge (All Fixed + Recurrent Expanded + AI Schedule + Preserved Flexible)
+      // existingFixedEvents contains all Google/Outlook/ManualFixed events (both inside and outside window)
+      const mergedEvents = [...existingFixedEvents, ...recurrenceEvents, ...newWeeklySchedule, ...preservedFlexibleEvents];
+      console.log('DEBUG: Merged Events', mergedEvents.length);
+      setEvents(mergedEvents);
     } catch (err: any) {
       console.error(err);
       setScheduleError(err.message || "Failed to generate schedule");
@@ -128,8 +395,28 @@ const App: React.FC = () => {
     }
   };
 
+  const [dayStartHour, setDayStartHour] = useState(9);
+  const [dayEndHour, setDayEndHour] = useState(18);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+
+  // Load Settings
+  useEffect(() => {
+    const savedSettings = localStorage.getItem('eisenflow_settings');
+    if (savedSettings) {
+      const { startHour, endHour } = JSON.parse(savedSettings);
+      setDayStartHour(startHour);
+      setDayEndHour(endHour);
+    }
+  }, []);
+
+  const handleSaveSettings = (settings: { startHour: number; endHour: number }) => {
+    setDayStartHour(settings.startHour);
+    setDayEndHour(settings.endHour);
+    localStorage.setItem('eisenflow_settings', JSON.stringify(settings));
+    // Trigger re-generation? Maybe not automatically, but the next generation will respect it.
+  };
+
   // Theme Helpers
-  // Enable dark mode for all redesigned tabs
   const isDark = true;
 
   const mainWrapperClass = isDark
@@ -143,6 +430,14 @@ const App: React.FC = () => {
   const navItemClass = (isActive: boolean) => isDark
     ? `w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-medium transition-all duration-300 ${isActive ? 'bg-orange-500/20 text-orange-400 shadow-[0_0_15px_rgba(251,146,60,0.1)]' : 'text-gray-400 hover:text-white hover:bg-white/5'}`
     : `w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-colors ${isActive ? 'bg-indigo-50 text-indigo-700' : 'text-gray-600 hover:bg-gray-50'}`;
+
+  if (isAuthLoading) {
+    return (
+      <div className="min-h-screen bg-gray-900 flex items-center justify-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-indigo-500"></div>
+      </div>
+    );
+  }
 
   return (
     <div className={mainWrapperClass}>
@@ -201,41 +496,48 @@ const App: React.FC = () => {
         </nav>
 
         <div className={`p-4 mt-auto border-t ${isDark ? 'border-white/5' : 'border-gray-100'}`}>
+          <button
+            onClick={() => setIsSettingsOpen(true)}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-medium transition-all duration-300 mb-2 ${isDark ? 'text-gray-400 hover:text-white hover:bg-white/5' : 'text-gray-600 hover:bg-gray-50'}`}
+          >
+            <Settings size={18} />
+            Settings
+          </button>
           {!isDark && (
+            // Light Mode Profile Card
             <div
-              onClick={() => setActiveTab('schedule')}
+              onClick={() => setIsAuthModalOpen(true)}
               className="bg-gradient-to-br from-indigo-600 to-violet-700 rounded-xl p-4 text-white shadow-lg relative overflow-hidden cursor-pointer hover:scale-[1.02] transition-transform"
             >
               <div className="absolute -top-6 -right-6 w-20 h-20 bg-white/10 rounded-full blur-xl"></div>
               <h4 className="font-bold text-xs uppercase tracking-wider opacity-70 mb-2 flex items-center gap-2">
                 <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse"></div>
-                Current Focus
+                {user ? 'Logged In' : 'Guest Mode'}
               </h4>
-              {currentEvent ? (
-                <div>
-                  <p className="font-bold text-lg leading-tight mb-1 line-clamp-2">{currentEvent.title}</p>
-                  <p className="text-xs opacity-80">
-                    Ends at {new Date(currentEvent.end).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                  </p>
-                </div>
-              ) : (
-                <div>
-                  <p className="font-bold text-lg leading-tight mb-1">Free Time</p>
-                </div>
-              )}
+              {/* ... */}
             </div>
           )}
           {isDark && (
-            <div className="bg-white/5 p-4 rounded-2xl border border-white/5 backdrop-blur-md">
+            <div
+              onClick={() => user ? logout() : setIsAuthModalOpen(true)}
+              className="bg-white/5 p-4 rounded-2xl border border-white/5 backdrop-blur-md cursor-pointer hover:bg-white/10 transition-colors group"
+            >
               <div className="flex items-center gap-3">
                 <div className="w-10 h-10 rounded-full bg-gradient-to-r from-orange-400 to-pink-500 p-[2px]">
-                  <div className="w-full h-full bg-black rounded-full flex items-center justify-center">
-                    <span className="text-xs font-bold text-orange-400">F</span>
+                  <div className="w-full h-full bg-black rounded-full flex items-center justify-center relative overflow-hidden">
+                    {user ? (
+                      <span className="text-xs font-bold text-orange-400">{user.name.charAt(0).toUpperCase()}</span>
+                    ) : (
+                      <UserIcon size={16} className="text-orange-400" />
+                    )}
                   </div>
                 </div>
-                <div>
-                  <p className="text-sm font-bold">Filomancio</p>
-                  <p className="text-xs text-gray-500">Premium Plan</p>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-bold truncate">{user ? user.name : "Guest User"}</p>
+                  <p className="text-xs text-gray-500 flex items-center gap-1 group-hover:text-orange-400 transition-colors">
+                    {user ? 'Sign Out' : 'Create Account'}
+                    {user && <LogOut size={10} />}
+                  </p>
                 </div>
               </div>
             </div>
@@ -245,15 +547,18 @@ const App: React.FC = () => {
 
       {/* Main Content */}
       <main className="flex-1 flex flex-col h-screen overflow-hidden relative z-10">
-
-        {/* Render Header Only for Non-Dashboard Views if desired, OR keep for all */}
-        {/* We can remove this shared header as each view now handles its own header inside the GlassCard */}
-
-
         {/* View Content */}
         <div className={`flex-1 overflow-hidden ${isDark ? '' : 'p-4 md:p-6 bg-[#F8FAFC]'}`}>
           {activeTab === 'dashboard' ? (
-            <DashboardView tasks={tasks} events={events} onNavigate={setActiveTab} />
+            <DashboardView
+              tasks={tasks}
+              events={events}
+              userName={user?.name || "Guest"}
+              onNavigate={setActiveTab}
+              onAddTask={handleSaveTask}
+              onDeleteTask={handleDeleteTask}
+              onAddEvent={handleAddEvent}
+            />
           ) : activeTab === 'matrix' ? (
             <MatrixView
               tasks={tasks}
@@ -277,6 +582,10 @@ const App: React.FC = () => {
                 dateStr={currentDate}
                 onDateChange={setCurrentDate}
                 error={scheduleError}
+                startHour={dayStartHour}
+                endHour={dayEndHour}
+                onConnectGoogle={handleConnectGoogle}
+                googleConnected={!!googleAccessToken}
               />
             </div>
           )}
@@ -291,8 +600,57 @@ const App: React.FC = () => {
           initialData={editingTask}
         />
       )}
+
+      {/* Auth Modal */}
+      <AuthModal
+        isOpen={isAuthModalOpen}
+        onClose={() => setIsAuthModalOpen(false)}
+        login={login}
+        signup={signup}
+      />
+
+      {/* Settings Modal */}
+      <SettingsModal
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
+        onSave={handleSaveSettings}
+        currentSettings={{ startHour: dayStartHour, endHour: dayEndHour }}
+      />
+
     </div>
   );
 };
 
-export default App;
+
+
+export default function App() {
+  const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
+
+  if (!googleClientId) {
+    // ... code for missing client ID ... (keep as is, or simplify if I can't see it)
+    // Actually I'll just rewrite the return to include ErrorBoundary
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gray-900 text-white">
+        <div className="p-8 bg-gray-800 rounded-xl border border-red-500/50 max-w-md text-center">
+          <h2 className="text-xl font-bold text-red-400 mb-4">Configuration Error</h2>
+          <p className="mb-4">Google Client ID is missing in environment variables.</p>
+          <code className="block p-3 bg-black/50 rounded text-sm text-gray-300 font-mono text-left">
+            VITE_GOOGLE_CLIENT_ID=...
+          </code>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <ErrorBoundary>
+      <GoogleOAuthProvider clientId={googleClientId}>
+        <AuthProvider>
+          <NotificationProvider>
+            <EisenFlowApp />
+          </NotificationProvider>
+        </AuthProvider>
+      </GoogleOAuthProvider>
+    </ErrorBoundary>
+  );
+}
