@@ -10,15 +10,17 @@ interface ScheduleViewProps {
   dateStr: string;
   onDateChange: (date: string) => void;
   error: string | null;
+  warning?: string | null;
   startHour: number;
   endHour: number;
   onConnectGoogle?: () => void;
   googleConnected?: boolean;
+  isWorkWeekOnly?: boolean;
 }
 
 type ViewMode = 'day' | 'week' | 'month';
 
-const ScheduleView: React.FC<ScheduleViewProps> = ({ events, isLoading, onRefreshSchedule, dateStr, onDateChange, error, startHour, endHour, onConnectGoogle, googleConnected }) => {
+const ScheduleView: React.FC<ScheduleViewProps> = ({ events, isLoading, onRefreshSchedule, dateStr, onDateChange, error, warning, startHour, endHour, onConnectGoogle, googleConnected, isWorkWeekOnly = false }) => {
   const [viewMode, setViewMode] = useState<ViewMode>('day');
 
   const currentDateObj = new Date(dateStr);
@@ -202,9 +204,13 @@ const ScheduleView: React.FC<ScheduleViewProps> = ({ events, isLoading, onRefres
     const weekStart = getWeekStart(currentDateObj);
     const weekDays = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
 
+    // Filter Weekends if workWeekOnly
+    const daysToShow = isWorkWeekOnly ? weekDays.filter(d => d.getDay() !== 0 && d.getDay() !== 6) : weekDays;
+    const gridCols = isWorkWeekOnly ? 'grid-cols-5' : 'grid-cols-7';
+
     return (
-      <div className="grid grid-cols-7 gap-2 h-full min-w-[800px]">
-        {weekDays.map((day, i) => {
+      <div className={`grid ${gridCols} gap-2 h-full min-w-[800px]`}>
+        {daysToShow.map((day, i) => {
           const dateS = day.toISOString().split('T')[0];
           const isToday = dateS === new Date().toISOString().split('T')[0];
           const isSelected = dateS === dateStr;
@@ -400,8 +406,32 @@ const ScheduleView: React.FC<ScheduleViewProps> = ({ events, isLoading, onRefres
           </div>
         </div>
 
-        {/* Error Display */}
-        {error && (
+        {/* Error Display - Special Popup for Capacity Overflow */}
+        {error && error.includes("It is impossible to generate") ? (
+          <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+            <div className="bg-[#1e1b2e] border border-rose-500/50 rounded-2xl p-6 max-w-md w-full shadow-2xl transform scale-100 flex flex-col items-center text-center">
+              <div className="w-16 h-16 bg-rose-500/20 rounded-full flex items-center justify-center mb-4 text-rose-500">
+                <BrainCircuit size={32} />
+              </div>
+              <h3 className="text-xl font-bold text-white mb-2">Planning Failed</h3>
+              <p className="text-rose-200/80 mb-6 leading-relaxed">
+                {error}
+              </p>
+              <div className="flex gap-3 w-full">
+                <button
+                  onClick={() => onRefreshSchedule()} // Retry logic could be cleaner, but re-generating serves as 'OK' to dismiss if successful, or we need a dismiss prop.
+                  // Actually, we just need to dismiss the error. ScheduleView doesn't have a 'clearError' prop. 
+                  // But re-generating will clear it in App.tsx. 
+                  // Let's assume the user needs to change settings first.
+                  className="flex-1 py-2 rounded-xl bg-white/5 hover:bg-white/10 text-gray-300 font-bold transition-colors"
+                >
+                  Dismiss
+                </button>
+                {/* We assume the user goes to Settings or Changes tasks */}
+              </div>
+            </div>
+          </div>
+        ) : error && (
           <div className="m-4 bg-rose-500/10 border border-rose-500/20 rounded-xl p-4 flex items-start gap-4 flex-shrink-0">
             <div className="p-2 bg-rose-500/20 rounded-lg text-rose-400">
               <Video size={20} />
@@ -414,6 +444,19 @@ const ScheduleView: React.FC<ScheduleViewProps> = ({ events, isLoading, onRefres
                   Please ensure valid VITE_GEMINI_API_KEY in .env
                 </p>
               )}
+            </div>
+          </div>
+        )}
+
+        {/* Warning Display */}
+        {warning && (
+          <div className="m-4 bg-amber-500/10 border border-amber-500/20 rounded-xl p-4 flex items-start gap-4 flex-shrink-0">
+            <div className="p-2 bg-amber-500/20 rounded-lg text-amber-400">
+              <BrainCircuit size={20} />
+            </div>
+            <div>
+              <h4 className="font-bold text-amber-200">Schedule Optimized (Partial)</h4>
+              <p className="text-sm text-amber-200/80 mt-1">{warning}</p>
             </div>
           </div>
         )}

@@ -20,7 +20,32 @@ const GlassToast: React.FC<ToastProps> = ({ id, message, type = 'info', duration
         return () => clearTimeout(timer);
     }, [id, duration, onClose]);
 
-    // ... icons logic
+    let icon;
+    let borderClass = 'border-white/10';
+    let bgClass = 'bg-white/5';
+
+    switch (type) {
+        case 'success':
+            icon = <CheckCircle className="text-emerald-400" size={24} />;
+            borderClass = 'border-emerald-500/30';
+            bgClass = 'bg-emerald-500/10';
+            break;
+        case 'warning':
+            icon = <AlertCircle className="text-amber-400" size={24} />;
+            borderClass = 'border-amber-500/30';
+            bgClass = 'bg-amber-500/10';
+            break;
+        case 'error':
+            icon = <AlertCircle className="text-rose-400" size={24} />;
+            borderClass = 'border-rose-500/30';
+            bgClass = 'bg-rose-500/10';
+            break;
+        default:
+            icon = <Info className="text-indigo-400" size={24} />;
+            borderClass = 'border-indigo-500/30';
+            bgClass = 'bg-indigo-500/10';
+            break;
+    }
 
     return (
         <div className="animate-in slide-in-from-right fade-in duration-300 mb-3 group relative">

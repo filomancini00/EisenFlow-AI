@@ -4,13 +4,14 @@ import { X, Save, Clock } from 'lucide-react';
 interface SettingsModalProps {
     isOpen: boolean;
     onClose: () => void;
-    onSave: (settings: { startHour: number; endHour: number }) => void;
-    currentSettings: { startHour: number; endHour: number };
+    onSave: (settings: { startHour: number; endHour: number; isWorkWeekOnly: boolean }) => void;
+    currentSettings: { startHour: number; endHour: number; isWorkWeekOnly: boolean };
 }
 
 const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, currentSettings }) => {
     const [startHour, setStartHour] = useState(currentSettings.startHour);
     const [endHour, setEndHour] = useState(currentSettings.endHour);
+    const [isWorkWeekOnly, setIsWorkWeekOnly] = useState(currentSettings.isWorkWeekOnly);
     const [error, setError] = useState<string | null>(null);
 
     if (!isOpen) return null;
@@ -21,7 +22,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
             return;
         }
         setError(null);
-        onSave({ startHour, endHour });
+        onSave({ startHour, endHour, isWorkWeekOnly });
         onClose();
     };
 
@@ -84,6 +85,27 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose, onSave, 
                                     <option key={h} value={h}>{h.toString().padStart(2, '0')}:00</option>
                                 ))}
                             </select>
+                        </div>
+                    </div>
+
+                    <div className="flex items-center justify-between p-4 bg-white/5 rounded-xl border border-white/5">
+                        <div className="flex flex-col">
+                            <span className="text-white font-medium">Full Week View</span>
+                            <span className="text-gray-400 text-xs">Show all 7 days vs Mon-Fri only</span>
+                        </div>
+                        <div className="flex items-center bg-black/40 p-1 rounded-lg border border-white/10">
+                            <button
+                                onClick={() => setIsWorkWeekOnly(false)}
+                                className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all ${!isWorkWeekOnly ? 'bg-orange-500 text-white shadow-lg' : 'text-gray-500 hover:text-white'}`}
+                            >
+                                Full Week
+                            </button>
+                            <button
+                                onClick={() => setIsWorkWeekOnly(true)}
+                                className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all ${isWorkWeekOnly ? 'bg-orange-500 text-white shadow-lg' : 'text-gray-500 hover:text-white'}`}
+                            >
+                                Mon-Fri
+                            </button>
                         </div>
                     </div>
                 </div>

@@ -1,4 +1,5 @@
 import React from 'react';
+import { createPortal } from 'react-dom';
 import { Task, CalendarEvent } from '../types';
 import { TrendingUp, CheckCircle, Clock, AlertCircle, ArrowRight, CreditCard, MoreVertical, Wallet, ArrowUpRight, ArrowDownRight, Bell, Search, Plus, MessageSquare, Send, X } from 'lucide-react';
 import GlassCard from './GlassCard';
@@ -33,7 +34,17 @@ const StatPill: React.FC<{ icon: React.ReactNode; label: string; value: string; 
       </div>
     </GlassCard>
   </div>
+
 );
+
+// Helper: Get Week Number
+const getWeekNumber = (d: Date) => {
+  d = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7));
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  const weekNo = Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+  return { week: weekNo, year: d.getUTCFullYear() };
+};
 
 const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName = "Filomancio", onNavigate, onAddTask, onDeleteTask, onAddEvent }) => {
   const [trendPeriod, setTrendPeriod] = React.useState<'week' | 'month'>('week');
@@ -164,21 +175,31 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
   const getTrendData = () => {
     const now = new Date();
     const dataPoints = [];
-    const days = trendPeriod === 'week' ? 7 : 30;
+    const pointsCount = trendPeriod === 'week' ? 7 : 30; // Use pointsCount to avoid confusion with 'days' variable
 
-    for (let i = days - 1; i >= 0; i--) {
+    for (let i = pointsCount - 1; i >= 0; i--) {
       const d = new Date();
       d.setDate(now.getDate() - i);
       const dateStr = d.toISOString().split('T')[0];
 
+      // Format Label
+      let label = "";
+      if (trendPeriod === 'week') {
+        // Week View: Full Day Name (Monday, Tuesday...)
+        label = d.toLocaleDateString('en-US', { weekday: 'long' });
+      } else {
+        // Month View: Week Number logic
+        const { week } = getWeekNumber(d);
+        label = `WK${week}`;
+      }
+
       // Count tasks completed on this day (Workable only)
-      // Note: We rely on t.completedAt being set. If legacy tasks don't have it, they won't show.
       const count = workableTasks.filter(t => {
         if (t.status !== 'completed' || !t.completedAt) return false;
         return t.completedAt.startsWith(dateStr);
       }).length;
 
-      dataPoints.push({ date: dateStr, count });
+      dataPoints.push({ date: dateStr, count, label, fullDate: d }); // added fullDate for easy comparison
     }
     return dataPoints;
   };
@@ -193,13 +214,20 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
 
     for (let i = 0; i < 7; i++) {
       const d = new Date(now);
+      // Fix: Render the NEXT 7 days properly, OR current week? 
+      // User asked for "Monday, Tuesday..." labels.
+      // If I start from today (Saturday), I get Sat, Sun, Mon... match user request?
+      // User said "put just the name of the days of the week (Monday , tuesday...)".
+      // It's likely they want the next 7 days.
       d.setDate(now.getDate() + i);
       const dateStr = d.toISOString().split('T')[0]; // YYYY-MM-DD
-      const dayLabel = d.toLocaleDateString(undefined, { weekday: 'short' });
 
-      // Find events for this day
-      // Note: events are ISO strings.
+      // FIX: Force English Locale
+      const dayLabel = d.toLocaleDateString('en-US', { weekday: 'short' }).toUpperCase();
+
       const dayEvents = events.filter(e => e.start.startsWith(dateStr) && e.type === 'task_block');
+      // ... (rest is same)
+
 
       const stats = {
         day: dayLabel,
@@ -338,57 +366,104 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
               <div className="flex-1 flex items-end justify-center relative mt-8 px-4 pb-8">
                 {/* Chart Container */}
                 <div className="w-full h-48 relative">
-                  {/* Y-Axis Grid & Labels - Improved Contrast */}
-                  {[0, 0.25, 0.5, 0.75, 1].map((tick) => (
-                    <div key={tick} className="absolute w-full flex items-center" style={{ bottom: `${tick * 100}%` }}>
-                      <div className="w-full h-[1px] bg-white/10"></div>
-                      <span className="absolute -left-6 text-[10px] text-gray-400">{Math.round(tick * maxTrend)}</span>
-                    </div>
-                  ))}
+                  {(() => {
+                    // Helper to generate nice Y-axis ticks
+                    const step = maxTrend <= 5 ? 1 : maxTrend <= 10 ? 2 : maxTrend <= 20 ? 5 : 10;
+                    const maxTick = Math.ceil(maxTrend / step) * step;
+                    const ticks = [];
+                    for (let i = 0; i <= maxTick; i += step) {
+                      ticks.push(i);
+                    }
+                    // Limit ticks if too many (prevent overcrowding)
+                    const displayTicks = ticks.filter((_, i) => ticks.length <= 6 || i % 2 === 0);
 
-                  <svg className="absolute inset-0 w-full h-full overflow-visible" viewBox={`0 0 100 100`} preserveAspectRatio="none">
-                    <defs>
-                      <linearGradient id="areaGradient" x1="0" x2="0" y1="0" y2="1">
-                        <stop offset="0%" stopColor="#F97316" stopOpacity="0.6" />
-                        <stop offset="100%" stopColor="#F97316" stopOpacity="0" />
-                      </linearGradient>
-                    </defs>
-
-                    {/* The Area Fill */}
-                    <polygon
-                      points={`0,100 ${trendData.map((d, i) => {
-                        const x = (i / (trendData.length - 1)) * 100;
-                        const y = 100 - (d.count / maxTrend) * 100;
-                        return `${x},${y}`;
-                      }).join(" ")} 100,100`}
-                      fill="url(#areaGradient)"
-                    />
-
-                    {/* The Line Stroke */}
-                    <polyline
-                      points={trendData.map((d, i) => {
-                        const x = (i / (trendData.length - 1)) * 100;
-                        const y = 100 - (d.count / maxTrend) * 100;
-                        return `${x},${y}`;
-                      }).join(" ")}
-                      fill="none"
-                      stroke="#F97316"
-                      strokeWidth="3"
-                      vectorEffect="non-scaling-stroke"
-                      className="drop-shadow-[0_0_8px_rgba(249,115,22,0.5)]"
-                    />
-
-                    {/* Data Points on Hover (or fixed for density) */}
-                    {trendData.map((d, i) => {
+                    // Helper for coordinates
+                    const getCoord = (d: any, i: number) => {
                       const x = (i / (trendData.length - 1)) * 100;
-                      const y = 100 - (d.count / maxTrend) * 100;
-                      return (
-                        <circle key={i} cx={`${x}%`} cy={`${y}%`} r="3" fill="white" className="opacity-0 hover:opacity-100 transition-opacity cursor-pointer">
-                          <title>{d.date}: {d.count} tasks</title>
-                        </circle>
-                      );
-                    })}
-                  </svg>
+                      // Use maxTick instead of maxTrend for scaling so line doesn't hit absolute top if not needed
+                      const y = 100 - (d.count / maxTick) * 100;
+                      return { x, y };
+                    };
+
+                    const points = trendData.map(getCoord);
+
+                    // Bezier Curve Logic
+                    const getSmoothPath = (points: { x: number, y: number }[], closeArea = false) => {
+                      if (points.length === 0) return "";
+                      if (points.length === 1) return closeArea ? `M0,100 L${points[0].x},${points[0].y} L100,100 Z` : "";
+
+                      let d = `M ${points[0].x},${points[0].y}`;
+
+                      for (let i = 0; i < points.length - 1; i++) {
+                        const p0 = i > 0 ? points[i - 1] : points[0];
+                        const p1 = points[i];
+                        const p2 = points[i + 1];
+                        const p3 = i !== points.length - 2 ? points[i + 2] : p2;
+
+                        const cp1x = p1.x + (p2.x - p0.x) / 6;
+                        // Fix: Clamp Y control points to prevent overshooting below chart (y=100)
+                        const cp1y = Math.min(100, p1.y + (p2.y - p0.y) / 6);
+
+                        const cp2x = p2.x - (p3.x - p1.x) / 6;
+                        const cp2y = Math.min(100, p2.y - (p3.y - p1.y) / 6);
+
+                        d += ` C ${cp1x},${cp1y} ${cp2x},${cp2y} ${p2.x},${p2.y}`;
+                      }
+
+                      if (closeArea) {
+                        d += ` L ${points[points.length - 1].x},100 L ${points[0].x},100 Z`;
+                      }
+
+                      return d;
+                    };
+
+                    const strokePath = getSmoothPath(points);
+                    const fillPath = getSmoothPath(points, true);
+
+                    return (
+                      <>
+                        {/* Y-Axis Grid & Labels */}
+                        {displayTicks.map((tick) => (
+                          <div key={tick} className="absolute w-full flex items-center" style={{ bottom: `${(tick / maxTick) * 100}%` }}>
+                            <div className="w-full h-[1px] bg-white/10"></div>
+                            <span className="absolute -left-6 text-[10px] text-gray-400 w-4 text-right">{tick}</span>
+                          </div>
+                        ))}
+
+                        <svg className="absolute inset-0 w-full h-full overflow-visible" viewBox={`0 0 100 100`} preserveAspectRatio="none">
+                          <defs>
+                            <linearGradient id="areaGradient" x1="0" x2="0" y1="0" y2="1">
+                              <stop offset="0%" stopColor="#F97316" stopOpacity="0.6" />
+                              <stop offset="100%" stopColor="#F97316" stopOpacity="0" />
+                            </linearGradient>
+                          </defs>
+
+                          {/* The Area Fill */}
+                          <path
+                            d={fillPath}
+                            fill="url(#areaGradient)"
+                          />
+
+                          {/* The Line Stroke */}
+                          <path
+                            d={strokePath}
+                            fill="none"
+                            stroke="#F97316"
+                            strokeWidth="3"
+                            vectorEffect="non-scaling-stroke"
+                            className="drop-shadow-[0_0_8px_rgba(249,115,22,0.5)]"
+                          />
+
+                          {/* Data Points on Hover */}
+                          {points.map((p, i) => (
+                            <circle key={i} cx={`${p.x}%`} cy={`${p.y}%`} r="3" fill="white" className="opacity-0 hover:opacity-100 transition-opacity cursor-pointer">
+                              <title>{trendData[i].date}: {trendData[i].count} tasks</title>
+                            </circle>
+                          ))}
+                        </svg>
+                      </>
+                    );
+                  })()}
 
                   {/* X-Axis Labels */}
                   <div className="absolute -bottom-6 w-full flex justify-between text-[10px] text-gray-400 font-medium tracking-wide">
@@ -507,7 +582,7 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
                     <span className="text-[10px] font-medium opacity-60">Tasks</span>
                   </div>
                   <div
-                    onClick={() => onNavigate('schedule')}
+                    onClick={() => setShowAlerts(true)}
                     className="flex flex-col items-center gap-2 cursor-pointer group"
                   >
                     <div className="w-12 h-12 rounded-2xl bg-white/5 flex items-center justify-center group-hover:bg-blue-500/20 transition-colors border border-white/5">
@@ -717,9 +792,9 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
         </div>
       )}
 
-      {/* Analytics Modal */}
-      {showAnalyticsModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
+      {/* Analytics Modal - PORTAL to fix overlap */}
+      {showAnalyticsModal && createPortal(
+        <div className="fixed inset-0 z-[9999] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
           <GlassCard className="w-full max-w-5xl h-[80vh] flex flex-col relative animate-in fade-in zoom-in-95 duration-200">
             <div className="flex items-center justify-between mb-6 p-2">
               <h2 className="text-2xl font-bold flex items-center gap-2">
@@ -751,41 +826,142 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
               {analyticsView === 'trend' ? (
                 <div className="w-full h-full flex flex-col">
                   <div className="flex justify-between items-center mb-4">
-                    <h3 className="text-lg font-bold text-gray-300">Tasks Completed Over Time</h3>
+                    <div>
+                      <h3 className="text-lg font-bold text-gray-300">Tasks Completed Over Time</h3>
+                      {trendPeriod === 'week' && (
+                        <p className="text-xs text-orange-400 font-mono mt-1">
+                          WK{getWeekNumber(new Date()).week} of {getWeekNumber(new Date()).year}
+                        </p>
+                      )}
+                    </div>
                     <div className="flex gap-2">
                       <button onClick={() => setTrendPeriod('week')} className={`px-3 py-1 rounded text-xs border border-white/10 ${trendPeriod === 'week' ? 'bg-white/20' : 'bg-transparent'}`}>Week</button>
                       <button onClick={() => setTrendPeriod('month')} className={`px-3 py-1 rounded text-xs border border-white/10 ${trendPeriod === 'month' ? 'bg-white/20' : 'bg-transparent'}`}>Month</button>
                     </div>
                   </div>
                   {/* Reuse Scaled Area Chart */}
-                  <div className="flex-1 relative w-full">
-                    <svg className="absolute inset-0 w-full h-full overflow-visible" viewBox="0 0 100 100" preserveAspectRatio="none">
-                      <defs>
-                        <linearGradient id="modalAreaGradient" x1="0" x2="0" y1="0" y2="1">
-                          <stop offset="0%" stopColor="#F97316" stopOpacity="0.5" />
-                          <stop offset="100%" stopColor="#F97316" stopOpacity="0" />
-                        </linearGradient>
-                      </defs>
-                      <polygon
-                        points={`0,100 ${trendData.map((d, i) => `${(i / (trendData.length - 1)) * 100},${100 - (d.count / maxTrend) * 100}`).join(" ")} 100,100`}
-                        fill="url(#modalAreaGradient)"
-                      />
-                      <polyline
-                        points={trendData.map((d, i) => `${(i / (trendData.length - 1)) * 100},${100 - (d.count / maxTrend) * 100}`).join(" ")}
-                        fill="none"
-                        stroke="#F97316"
-                        strokeWidth="1" // Thinner visual stroke when scaled up, or use vector-effect
-                        vectorEffect="non-scaling-stroke"
-                      />
-                    </svg>
+                  {/* Reuse Scaled Area Chart */}
+                  <div className="flex-1 relative w-full pt-4">
+                    {(() => {
+                      // Helper to generate nice Y-axis ticks
+                      const step = maxTrend <= 5 ? 1 : maxTrend <= 10 ? 2 : maxTrend <= 20 ? 5 : 10;
+                      const maxTick = Math.ceil(maxTrend / step) * step;
+                      const ticks = [];
+                      for (let i = 0; i <= maxTick; i += step) {
+                        ticks.push(i);
+                      }
+                      const displayTicks = ticks.filter((_, i) => ticks.length <= 6 || i % 2 === 0);
+
+                      const getCoord = (d: any, i: number) => {
+                        const x = (i / (trendData.length - 1)) * 100;
+                        const y = 100 - (d.count / maxTick) * 100;
+                        return { x, y };
+                      };
+
+                      const points = trendData.map(getCoord);
+
+                      const getSmoothPath = (points: { x: number, y: number }[], closeArea = false) => {
+                        if (points.length === 0) return "";
+                        if (points.length === 1) return closeArea ? `M0,100 L${points[0].x},${points[0].y} L100,100 Z` : "";
+
+                        let d = `M ${points[0].x},${points[0].y}`;
+                        for (let i = 0; i < points.length - 1; i++) {
+                          const p0 = i > 0 ? points[i - 1] : points[0];
+                          const p1 = points[i];
+                          const p2 = points[i + 1];
+                          const p3 = i !== points.length - 2 ? points[i + 2] : p2;
+                          const cp1x = p1.x + (p2.x - p0.x) / 6;
+                          // Fix: Clamp Y control points to prevent overshooting below chart (y=100)
+                          const cp1y = Math.min(100, p1.y + (p2.y - p0.y) / 6);
+
+                          const cp2x = p2.x - (p3.x - p1.x) / 6;
+                          const cp2y = Math.min(100, p2.y - (p3.y - p1.y) / 6);
+                          d += ` C ${cp1x},${cp1y} ${cp2x},${cp2y} ${p2.x},${p2.y}`;
+                        }
+                        if (closeArea) {
+                          d += ` L ${points[points.length - 1].x},100 L ${points[0].x},100 Z`;
+                        }
+                        return d;
+                      };
+
+                      const strokePath = getSmoothPath(points);
+                      const fillPath = getSmoothPath(points, true);
+
+                      return (
+                        <>
+                          {/* Y-Axis Grid & Labels */}
+                          {displayTicks.map((tick) => (
+                            <div key={tick} className="absolute w-full flex items-center" style={{ bottom: `${(tick / maxTick) * 100}%` }}>
+                              <div className="w-full h-[1px] bg-white/10"></div>
+                              <span className="absolute -left-6 text-[10px] text-gray-400 w-4 text-right">{tick}</span>
+                            </div>
+                          ))}
+
+                          <svg className="absolute inset-0 w-full h-full overflow-visible" viewBox="0 0 100 100" preserveAspectRatio="none">
+                            <defs>
+                              <linearGradient id="modalAreaGradient" x1="0" x2="0" y1="0" y2="1">
+                                <stop offset="0%" stopColor="#F97316" stopOpacity="0.5" />
+                                <stop offset="100%" stopColor="#F97316" stopOpacity="0" />
+                              </linearGradient>
+                            </defs>
+                            <path d={fillPath} fill="url(#modalAreaGradient)" />
+                            <path d={strokePath} fill="none" stroke="#F97316" strokeWidth="2" vectorEffect="non-scaling-stroke" />
+
+                            {points.map((p, i) => (
+                              <circle key={i} cx={`${p.x}%`} cy={`${p.y}%`} r="4" fill="white" className="opacity-0 hover:opacity-100 transition-opacity cursor-pointer">
+                                <title>{trendData[i].date}: {trendData[i].count} tasks</title>
+                              </circle>
+                            ))}
+                          </svg>
+                        </>
+                      );
+                    })()}
                     {/* Modal X-Axis Labels */}
                     <div className="absolute bottom-0 w-full flex justify-between text-xs text-gray-500 pt-2 border-t border-white/10">
-                      {trendData.map((d, i) => (
-                        <div key={i} className="text-center w-8">
-                          <div className="h-2 w-[1px] bg-white/20 mx-auto mb-1"></div>
-                          {d.date.slice(5)}
-                        </div>
-                      ))}
+                      {trendPeriod === 'week' ? (
+                        // WEEK VIEW: Show all days (Mon, Tue, Wed...)
+                        trendData.map((d, i) => (
+                          <div key={i} className="text-center w-full">
+                            <div className="h-2 w-[1px] bg-white/20 mx-auto mb-1"></div>
+                            <span className="hidden sm:inline">{d.label}</span>
+                            <span className="sm:hidden">{d.label.slice(0, 3)}</span> {/* Abbr on tiny screens */}
+                          </div>
+                        ))
+                      ) : (
+                        // MONTH VIEW: Show Week Numbers (Centered per week block)
+                        trendData.map((d, i) => {
+                          // Find boundaries of this week in the current dataset
+                          const startIndex = trendData.findIndex(pd => pd.label === d.label);
+
+                          // findLastIndex manual implementation
+                          let endIndex = trendData.length - 1;
+                          for (let j = trendData.length - 1; j >= 0; j--) {
+                            if (trendData[j].label === d.label) {
+                              endIndex = j;
+                              break;
+                            }
+                          }
+
+                          const centerIndex = Math.floor((startIndex + endIndex) / 2);
+                          const showLabel = i === centerIndex;
+                          const isStartOfWeek = i === startIndex;
+
+                          return (
+                            <div key={i} className="text-center w-full relative">
+                              {/* Optional: Tick separater at start of week
+                              {isStartOfWeek && <div className="absolute left-0 bottom-full h-1 w-[1px] bg-white/10"></div>} 
+                              */}
+
+                              {showLabel && (
+                                <>
+                                  <div className="h-2 w-[1px] bg-white/20 mx-auto mb-1"></div>
+                                  <span className="absolute left-1/2 -translate-x-1/2 whitespace-nowrap">{d.label}</span>
+                                </>
+                              )}
+                            </div>
+                          );
+                        })
+                      )}
                     </div>
                   </div>
                 </div>
@@ -794,10 +970,11 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
                   <h3 className="text-lg font-bold text-gray-300 mb-8">projected Workload (Next 7 Days)</h3>
                   {/* Reuse Stacked Bar Chart Logic but Bigger */}
                   <div className="flex-1 flex items-end justify-between gap-6 px-8 pb-8">
+
                     {weeklyWorkload.map((day, i) => {
-                      const hQ1 = (day.Q1 / maxDailyHours) * 100;
-                      const hQ2 = (day.Q2 / maxDailyHours) * 100;
-                      const hQ3 = (day.Q3 / maxDailyHours) * 100;
+                      const hQ1 = (day.Q1 / (maxDailyHours || 1)) * 100;
+                      const hQ2 = (day.Q2 / (maxDailyHours || 1)) * 100;
+                      const hQ3 = (day.Q3 / (maxDailyHours || 1)) * 100;
                       const hQ4 = (day.Q4 / maxDailyHours) * 100;
 
                       return (
@@ -813,6 +990,7 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
                         </div>
                       );
                     })}
+
                   </div>
                   {/* Legend */}
                   <div className="flex justify-center gap-8 mt-4 border-t border-white/5 pt-4">
@@ -826,7 +1004,7 @@ const DashboardView: React.FC<DashboardViewProps> = ({ tasks, events, userName =
             </div>
           </GlassCard>
         </div>
-      )}
+        , document.body)}
 
       {/* AI Chat Widget (Floating) */}
       <div className={`fixed bottom-6 right-6 z-50 flex flex-col items-end gap-4 transition-all duration-300`}>

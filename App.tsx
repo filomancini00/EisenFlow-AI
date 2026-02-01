@@ -19,6 +19,7 @@ import { supabase } from './services/supabaseClient';
 import { GoogleOAuthProvider, useGoogleLogin } from '@react-oauth/google';
 import { getGoogleCalendarEvents } from './services/googleCalendarService';
 import ErrorBoundary from './components/ErrorBoundary';
+import { expandFixedTasks } from './utils/scheduleUtils';
 
 const EisenFlowApp: React.FC = () => {
   const { user, login, signup, logout, isLoading: isAuthLoading } = useAuth();
@@ -35,16 +36,10 @@ const EisenFlowApp: React.FC = () => {
   const [editingTask, setEditingTask] = useState<Task | undefined>(undefined);
   const [isLoadingSchedule, setIsLoadingSchedule] = useState(false);
   const [scheduleError, setScheduleError] = useState<string | null>(null);
+  const [scheduleWarning, setScheduleWarning] = useState<string | null>(null);
   const [googleAccessToken, setGoogleAccessToken] = useState<string | null>(() => localStorage.getItem('google_access_token'));
 
   // Persist Google Token
-  useEffect(() => {
-    if (googleAccessToken) {
-      localStorage.setItem('google_access_token', googleAccessToken);
-    } else {
-      localStorage.removeItem('google_access_token');
-    }
-  }, [googleAccessToken]);
 
   // Date state - defaults to today
   const [currentDate, setCurrentDate] = useState(new Date().toISOString().split('T')[0]);
@@ -114,6 +109,46 @@ const EisenFlowApp: React.FC = () => {
     localStorage.setItem('eisenflow_events_guest', JSON.stringify(events));
   }, [events, user, isAuthLoading]);
 
+  // Real-time Linked Task Update & Auto-Expand Fixed Tasks
+  useEffect(() => {
+    if (!tasks || tasks.length === 0) return;
+
+    setEvents(prevEvents => {
+      let updatedEvents = [...prevEvents];
+      let hasChanges = false;
+
+      // 1. Update Existing Linked Events (Title/Desc Changes)
+      updatedEvents = updatedEvents.map(ev => {
+        if (!ev.taskId) return ev;
+        const task = tasks.find(t => t.id === ev.taskId);
+        if (task && (ev.title !== task.title)) {
+          hasChanges = true;
+          return { ...ev, title: task.title };
+        }
+        return ev;
+      });
+
+      // 2. Refresh Fixed Tasks (Auto-generate for next 30 days to cover immediate needs)
+      // This ensures that as soon as a user adds a Fixed Task, it appears in events (and thus notifications)
+      // Use currentDate to be deterministic and avoid millisecond mismatches
+      const newFixedEvents = expandFixedTasks(tasks, new Date(currentDate), 30);
+
+      // Remove OLD Fixed events (that start with 'fixed-') because we are regenerating them
+      // But keep everything else (Google events, AI generated flexible blocks, Meetings)
+      const nonFixedEvents = updatedEvents.filter(e => !e.id.startsWith('fixed-'));
+
+      // Check if new set is different from what we would have
+      // We can just bluntly replace the 'fixed-' portion
+      const currentFixedEvents = updatedEvents.filter(e => e.id.startsWith('fixed-'));
+
+      if (JSON.stringify(currentFixedEvents) !== JSON.stringify(newFixedEvents) || hasChanges) {
+        return [...nonFixedEvents, ...newFixedEvents];
+      }
+
+      return prevEvents;
+    });
+  }, [tasks]);
+
 
   const handleSaveTask = async (task: Task) => {
     // Logic to handle completion timestamp
@@ -136,9 +171,12 @@ const EisenFlowApp: React.FC = () => {
 
     // Persist
     if (user) {
+      // Sanitize payload for Supabase (remove fields not in DB schema)
+      const { startTime, finishTime, ...taskPayload } = updatedTask;
+
       // Supabase Upsert
       const { error } = await supabase.from('tasks').upsert({
-        ...updatedTask,
+        ...taskPayload,
         user_id: user.id
       });
       if (error) console.error("Failed to save task:", error);
@@ -278,65 +316,13 @@ const EisenFlowApp: React.FC = () => {
     }
 
     try {
-      // 1. Separate tasks
-      const fixedTasks = tasks.filter(t => t.isFixed);
-      const flexibleTasks = tasks.filter(t => !t.isFixed);
+      // 1. Separate tasks (Filter out completed ones)
+      const pendingTasks = tasks.filter(t => t.status !== 'completed');
+      const fixedTasks = pendingTasks.filter(t => t.isFixed);
+      const flexibleTasks = pendingTasks.filter(t => !t.isFixed);
 
       // 2. Expand Fixed Tasks into Events (Recurrence Logic)
-      const recurrenceEvents: CalendarEvent[] = [];
-      const windowStart = new Date(currentDate);
-
-      fixedTasks.forEach(task => {
-        const startTime = task.startTime || "09:00";
-
-        for (let i = 0; i < 7; i++) {
-          const day = new Date(windowStart);
-          day.setDate(day.getDate() + i);
-          const dateStr = day.toISOString().split('T')[0];
-          const startIso = `${dateStr}T${startTime}:00`;
-
-          let endIso;
-          if (task.finishTime) {
-            const startDate = new Date(startIso);
-            const endDate = new Date(`${dateStr}T${task.finishTime}:00`);
-            if (endDate <= startDate) {
-              endDate.setDate(endDate.getDate() + 1); // Handle overnight
-            }
-            endIso = endDate.toISOString().slice(0, 19);
-          } else {
-            // Fallback to estimatedHours
-            let duration = Number(task.estimatedHours);
-            if (!duration || isNaN(duration) || duration <= 0) {
-              duration = 1; // Default to 1 hour if invalid
-            }
-            endIso = new Date(new Date(startIso).getTime() + (duration * 3600000)).toISOString().slice(0, 19);
-          }
-
-          let shouldAdd = false;
-          if (task.recurrence === 'daily') shouldAdd = true;
-          else if (task.recurrence === 'weekly' && day.getDay() === new Date(task.deadline).getDay()) shouldAdd = true; // Use deadline as "day of week" reference
-          else if (task.recurrence === 'weekdays' && day.getDay() !== 0 && day.getDay() !== 6) shouldAdd = true;
-          else if (!task.recurrence || task.recurrence === 'none') {
-            // Only add if date matches deadline (Single Instance) - but strict check? 
-            // Or if it falls within window. Let's assume strict deadline match for single instance.
-            if (dateStr === task.deadline.split('T')[0]) shouldAdd = true;
-          }
-
-          if (shouldAdd) {
-            recurrenceEvents.push({
-              id: `fixed-${task.id}-${dateStr}`,
-              title: task.title,
-              start: startIso,
-              end: endIso,
-              type: 'task_block',
-              taskId: task.id,
-              isFixed: true, // Treated as fixed for the AI
-              reasoning: "Fixed Commitment",
-              quadrant: 'Q4'
-            });
-          }
-        }
-      });
+      const recurrenceEvents = expandFixedTasks(fixedTasks, new Date(currentDate), 7);
 
       // 3. Get existing fixed events (Outlook/Calendar)
       // Debug log
@@ -347,7 +333,19 @@ const EisenFlowApp: React.FC = () => {
       const allFixedConstraints = [...existingFixedEvents, ...recurrenceEvents];
 
       // 4. Generate new schedule for NEXT 7 DAYS with Flexible Tasks only
-      let newWeeklySchedule = await optimizeSchedule(flexibleTasks, allFixedConstraints, currentDate, 7, dayStartHour, dayEndHour);
+      // Pass isWorkWeekOnly to the optimizer
+      const optimizationResult = await optimizeSchedule(flexibleTasks, allFixedConstraints, currentDate, 7, dayStartHour, dayEndHour, isWorkWeekOnly);
+
+      let newWeeklySchedule = optimizationResult.schedule;
+      const unscheduledIds = optimizationResult.unscheduledTaskIds;
+
+      // Notify about unscheduled tasks
+      if (unscheduledIds && unscheduledIds.length > 0) {
+        // Find titles for better message
+        const count = unscheduledIds.length;
+        setScheduleError(`Schedule generated, but ${count} tasks could not fit in availability.`);
+        // Note: In a real app we'd use a Toast here, but setting error state works for visibility
+      }
 
       // 4b. CORRECT THE QUADRANTS (Don't trust AI labels)
       newWeeklySchedule = newWeeklySchedule.map(ev => {
@@ -363,7 +361,7 @@ const EisenFlowApp: React.FC = () => {
       });
 
       // 5. Define the window to clear
-      const endWindow = new Date(windowStart);
+      const endWindow = new Date(currentDate);
       endWindow.setDate(endWindow.getDate() + 7);
       const endWindowStr = endWindow.toISOString().split('T')[0];
 
@@ -379,7 +377,8 @@ const EisenFlowApp: React.FC = () => {
         fixed: existingFixedEvents.length,
         recurrence: recurrenceEvents.length,
         newWeekly: newWeeklySchedule.length,
-        preservedFlex: preservedFlexibleEvents.length
+        preservedFlex: preservedFlexibleEvents.length,
+        unscheduled: unscheduledIds?.length || 0
       });
 
       // 7. Merge (All Fixed + Recurrent Expanded + AI Schedule + Preserved Flexible)
@@ -387,9 +386,18 @@ const EisenFlowApp: React.FC = () => {
       const mergedEvents = [...existingFixedEvents, ...recurrenceEvents, ...newWeeklySchedule, ...preservedFlexibleEvents];
       console.log('DEBUG: Merged Events', mergedEvents.length);
       setEvents(mergedEvents);
+
+      // Warning Toast / State (Non-blocking)
+      if (unscheduledIds && unscheduledIds.length > 0) {
+        const count = unscheduledIds.length;
+        setScheduleWarning(`Schedule optimized, but ${count} lower-priority tasks could not fit.`);
+      }
+
     } catch (err: any) {
-      console.error(err);
-      setScheduleError(err.message || "Failed to generate schedule");
+      console.error("Schedule Generation Failed:", err);
+      // Clean up the error message for display
+      const errorMessage = err.message || (typeof err === 'string' ? err : "Failed to generate schedule due to an unknown error.");
+      setScheduleError(errorMessage);
     } finally {
       setIsLoadingSchedule(false);
     }
@@ -397,21 +405,24 @@ const EisenFlowApp: React.FC = () => {
 
   const [dayStartHour, setDayStartHour] = useState(9);
   const [dayEndHour, setDayEndHour] = useState(18);
+  const [isWorkWeekOnly, setIsWorkWeekOnly] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
   // Load Settings
   useEffect(() => {
     const savedSettings = localStorage.getItem('eisenflow_settings');
     if (savedSettings) {
-      const { startHour, endHour } = JSON.parse(savedSettings);
+      const { startHour, endHour, isWorkWeekOnly: savedIsWorkWeek } = JSON.parse(savedSettings);
       setDayStartHour(startHour);
       setDayEndHour(endHour);
+      if (savedIsWorkWeek !== undefined) setIsWorkWeekOnly(savedIsWorkWeek);
     }
   }, []);
 
-  const handleSaveSettings = (settings: { startHour: number; endHour: number }) => {
+  const handleSaveSettings = (settings: { startHour: number; endHour: number; isWorkWeekOnly: boolean }) => {
     setDayStartHour(settings.startHour);
     setDayEndHour(settings.endHour);
+    setIsWorkWeekOnly(settings.isWorkWeekOnly);
     localStorage.setItem('eisenflow_settings', JSON.stringify(settings));
     // Trigger re-generation? Maybe not automatically, but the next generation will respect it.
   };
@@ -582,6 +593,7 @@ const EisenFlowApp: React.FC = () => {
                 dateStr={currentDate}
                 onDateChange={setCurrentDate}
                 error={scheduleError}
+                warning={scheduleWarning}
                 startHour={dayStartHour}
                 endHour={dayEndHour}
                 onConnectGoogle={handleConnectGoogle}
@@ -614,7 +626,7 @@ const EisenFlowApp: React.FC = () => {
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}
         onSave={handleSaveSettings}
-        currentSettings={{ startHour: dayStartHour, endHour: dayEndHour }}
+        currentSettings={{ startHour: dayStartHour, endHour: dayEndHour, isWorkWeekOnly }}
       />
 
     </div>

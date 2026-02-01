@@ -63,7 +63,7 @@ const TaskForm: React.FC<TaskFormProps> = ({ onSave, onCancel, initialData }) =>
     }
 
     onSave({
-      id: initialData?.id || `task-${Date.now()}`,
+      id: initialData?.id || crypto.randomUUID(),
       title: formData.title,
       relevance: Number(formData.relevance),
       urgency: Number(formData.urgency),
